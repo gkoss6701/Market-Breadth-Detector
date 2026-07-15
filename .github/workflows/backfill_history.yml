@@ -1,0 +1,34 @@
+name: Backfill History (run once)
+
+on:
+  workflow_dispatch:
+    inputs:
+      years:
+        description: "Years of history to backfill"
+        required: false
+        default: "2"
+
+permissions:
+  contents: write
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run backfill
+        env:
+          BREADTH_DB_PATH: data/breadth.db
+        run: python -m scripts.backfill_history --years "${{ github.event.inputs.years }}"
+      - name: Commit backfilled DB
+        run: |
+          git config user.name "breadth-bot"
+          git config user.email "breadth-bot@users.noreply.github.com"
+          git add -f data/breadth.db
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Historical backfill (${{ github.event.inputs.years }} years)"
+          git push

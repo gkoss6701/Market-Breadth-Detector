@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+# data/breadth.db is intentionally committed by the GitHub Actions
+# workflows (daily_ingest.yml / breadth_compute.yml) -- do NOT ignore it.
+# Ignore any other stray local db files instead (e.g. scratch/test dbs).
+data/*.db-journal
+data/local_*.db
+.env
+.DS_Store

@@ -1,0 +1,37 @@
+name: Breadth Compute
+
+on:
+  workflow_run:
+    workflows: ["Daily Ingest"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # required to commit/push the updated DB back to the repo
+
+jobs:
+  compute:
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Compute breadth + check alerts
+        env:
+          BREADTH_DB_PATH: data/breadth.db
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+          ALERT_TO_NUMBER: ${{ secrets.ALERT_TO_NUMBER }}
+        run: python -m scripts.breadth_compute
+      - name: Commit updated DB
+        run: |
+          git config user.name "breadth-bot"
+          git config user.email "breadth-bot@users.noreply.github.com"
+          git add -f data/breadth.db
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Breadth compute $(date -u +%Y-%m-%d)"
+          git push
