@@ -22,7 +22,7 @@ from src.ingestion.yfinance_client import fetch_bulk_ohlcv
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-UNIVERSE_CSV = "data/universe.csv"
+UNIVERSE_CSV = "data/SP500.csv"
 
 
 def main():

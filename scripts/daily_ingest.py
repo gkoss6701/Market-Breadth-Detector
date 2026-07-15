@@ -18,7 +18,7 @@ from src.ingestion.yfinance_client import fetch_bulk_ohlcv
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-UNIVERSE_CSV = "data/universe.csv"
+UNIVERSE_CSV = "data/SP500.csv"
 LOOKBACK_DAYS = 10  # small trailing window; prices table upserts, so overlap
                      # is cheap insurance against a missed run or long weekend
 
