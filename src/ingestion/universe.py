@@ -20,15 +20,42 @@ the bottom for options if you need point-in-time accuracy.
 """
 from __future__ import annotations
 
+import io
 import logging
 
 import pandas as pd
+import requests
 
 logger = logging.getLogger(__name__)
 
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 NASDAQ100_WIKI_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
 DOW30_WIKI_URL = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
+
+# Wikipedia (and many sites) reject requests with the generic User-Agent
+# that urllib/pandas sends by default -- pd.read_html(url) has no way to
+# set headers, and this returns an HTTP 403 that's easy to mistake for a
+# "the page changed" failure. Fetch the HTML ourselves with a normal
+# browser-like User-Agent, then hand the text to pd.read_html.
+_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+}
+
+
+def _read_html_tables(url: str) -> list[pd.DataFrame]:
+    """pd.read_html with an explicit User-Agent (see module note above),
+    a real timeout, and an error message that names the URL and status
+    code rather than a bare traceback."""
+    try:
+        resp = requests.get(url, headers=_HEADERS, timeout=20)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        raise RuntimeError(
+            f"Failed to fetch {url} ({e}). If this is a 403, Wikipedia may be "
+            f"rate-limiting the runner's IP -- retry, or check the URL is still valid."
+        ) from e
+    return pd.read_html(io.StringIO(resp.text))
 
 # GICS sector names as they appear in the S&P 500 Wikipedia table.
 GICS_SECTORS = [
@@ -52,8 +79,13 @@ def _clean_ticker(t: str) -> str:
 
 def fetch_sp500_with_sectors() -> pd.DataFrame:
     """Returns DataFrame [ticker, sector] for the current S&P 500."""
-    tables = pd.read_html(SP500_WIKI_URL)
+    tables = _read_html_tables(SP500_WIKI_URL)
     df = tables[0]
+    if "Symbol" not in df.columns or "GICS Sector" not in df.columns:
+        raise RuntimeError(
+            "S&P 500 Wikipedia table is missing expected 'Symbol'/'GICS Sector' "
+            f"columns (found: {list(df.columns)}) -- page layout may have changed."
+        )
     out = pd.DataFrame({
         "ticker": df["Symbol"].map(_clean_ticker),
         "sector": df["GICS Sector"],
@@ -63,7 +95,7 @@ def fetch_sp500_with_sectors() -> pd.DataFrame:
 
 def fetch_nasdaq100() -> list[str]:
     """Returns current Nasdaq-100 constituent tickers."""
-    tables = pd.read_html(NASDAQ100_WIKI_URL)
+    tables = _read_html_tables(NASDAQ100_WIKI_URL)
     # The constituents table is identified by having a 'Ticker' column;
     # its position on the page has shifted before, so search for it
     # rather than hardcoding a table index.
@@ -77,11 +109,13 @@ def fetch_nasdaq100() -> list[str]:
 
 def fetch_dow30() -> list[str]:
     """Returns current Dow Jones Industrial Average constituent tickers."""
-    tables = pd.read_html(DOW30_WIKI_URL)
+    tables = _read_html_tables(DOW30_WIKI_URL)
+    candidates = ("Symbol", "Ticker", "Ticker symbol")
     for t in tables:
         cols = {c.strip() for c in t.columns.astype(str)}
-        if "Symbol" in cols and len(t) in range(25, 35):  # DJIA has 30 components
-            return sorted({_clean_ticker(x) for x in t["Symbol"].dropna()})
+        matched = next((c for c in candidates if c in cols), None)
+        if matched and len(t) in range(20, 35):  # DJIA has 30 components
+            return sorted({_clean_ticker(x) for x in t[matched].dropna()})
     raise RuntimeError("Could not locate Dow 30 constituents table on Wikipedia page "
                         "-- page layout may have changed, inspect DOW30_WIKI_URL manually.")
 
