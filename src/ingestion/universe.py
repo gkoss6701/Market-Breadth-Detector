@@ -93,31 +93,74 @@ def fetch_sp500_with_sectors() -> pd.DataFrame:
     return out.drop_duplicates(subset="ticker").reset_index(drop=True)
 
 
+def _find_ticker_table(
+    tables: list[pd.DataFrame],
+    candidates: tuple[str, ...],
+    expected_rows: range | None = None,
+    context: str = "",
+) -> tuple[pd.DataFrame, str]:
+    """Search `tables` for one containing a column matching any name in
+    `candidates` (case/whitespace-insensitive), optionally constrained to
+    a plausible row count. Returns (table, matched_column_name).
+
+    On failure, logs every table's shape and column names at INFO level --
+    this is the actual diagnostic you need when Wikipedia renames a column
+    (as happened with the Nasdaq-100 page), so the next failure is visible
+    directly in the workflow log instead of requiring another round trip.
+    """
+    normalized_candidates = {c.strip().lower() for c in candidates}
+    best_match = None
+
+    for t in tables:
+        col_map = {str(c).strip(): str(c).strip() for c in t.columns}
+        for col in col_map:
+            if col.strip().lower() in normalized_candidates:
+                if expected_rows is None or len(t) in expected_rows:
+                    return t, col
+                # Right column name but implausible row count -- keep as a
+                # fallback in case no better match is found.
+                if best_match is None:
+                    best_match = (t, col)
+
+    if best_match is not None:
+        logger.warning("%s: matched column but row count was outside the expected "
+                        "range (%d rows) -- using it anyway, verify the result.",
+                        context, len(best_match[0]))
+        return best_match
+
+    logger.info("%s: no matching table found. Tables on the page:", context)
+    for i, t in enumerate(tables):
+        logger.info("  table[%d]: %d rows, columns=%s", i, len(t), list(t.columns))
+    raise RuntimeError(
+        f"Could not locate the {context} constituents table -- page layout has "
+        f"likely changed (tried column names: {candidates}). See the INFO log "
+        f"lines above this error for every table's actual columns on the page; "
+        f"update the `candidates` tuple in src/ingestion/universe.py to match."
+    )
+
+
 def fetch_nasdaq100() -> list[str]:
     """Returns current Nasdaq-100 constituent tickers."""
     tables = _read_html_tables(NASDAQ100_WIKI_URL)
-    # The constituents table is identified by having a 'Ticker' column;
-    # its position on the page has shifted before, so search for it
-    # rather than hardcoding a table index.
-    for t in tables:
-        cols = {c.strip() for c in t.columns.astype(str)}
-        if "Ticker" in cols:
-            return sorted({_clean_ticker(x) for x in t["Ticker"].dropna()})
-    raise RuntimeError("Could not locate Nasdaq-100 constituents table on Wikipedia page "
-                        "-- page layout may have changed, inspect NASDAQ100_WIKI_URL manually.")
+    table, col = _find_ticker_table(
+        tables,
+        candidates=("Ticker", "Symbol", "Ticker symbol", "Ticker Symbol"),
+        expected_rows=range(90, 115),  # ~100 components, some share classes
+        context="Nasdaq-100",
+    )
+    return sorted({_clean_ticker(x) for x in table[col].dropna()})
 
 
 def fetch_dow30() -> list[str]:
     """Returns current Dow Jones Industrial Average constituent tickers."""
     tables = _read_html_tables(DOW30_WIKI_URL)
-    candidates = ("Symbol", "Ticker", "Ticker symbol")
-    for t in tables:
-        cols = {c.strip() for c in t.columns.astype(str)}
-        matched = next((c for c in candidates if c in cols), None)
-        if matched and len(t) in range(20, 35):  # DJIA has 30 components
-            return sorted({_clean_ticker(x) for x in t[matched].dropna()})
-    raise RuntimeError("Could not locate Dow 30 constituents table on Wikipedia page "
-                        "-- page layout may have changed, inspect DOW30_WIKI_URL manually.")
+    table, col = _find_ticker_table(
+        tables,
+        candidates=("Symbol", "Ticker", "Ticker symbol", "Ticker Symbol"),
+        expected_rows=range(20, 35),  # DJIA has 30 components
+        context="Dow 30",
+    )
+    return sorted({_clean_ticker(x) for x in table[col].dropna()})
 
 
 def fetch_russell2000() -> list[str]:
