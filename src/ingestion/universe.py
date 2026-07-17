@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 
 import pandas as pd
 import requests
@@ -93,49 +94,117 @@ def fetch_sp500_with_sectors() -> pd.DataFrame:
     return out.drop_duplicates(subset="ticker").reset_index(drop=True)
 
 
+_TICKER_RE = re.compile(r"^[A-Z0-9]{1,6}([.\-][A-Z0-9]{1,2})?$")
+
+
+def _flatten_columns(t: pd.DataFrame) -> pd.DataFrame:
+    """Wikipedia tables with multi-row headers (e.g. a table with grouped
+    'Added'/'Removed' sub-columns) produce a MultiIndex, so a column that
+    displays as "Ticker" can internally be a tuple like ('Added', 'Ticker').
+    str(the_tuple) won't equal "Ticker", which silently breaks exact-name
+    matching -- this is what actually broke the Nasdaq-100 fetch (that
+    page has a constituents table AND a separate historical changes table,
+    the latter with grouped Added/Removed columns). Flatten defensively so
+    every downstream check works against a clean single-level string
+    regardless of which shape pandas produced.
+    """
+    if isinstance(t.columns, pd.MultiIndex):
+        t = t.copy()
+        t.columns = [
+            " ".join(str(p) for p in col if p and "Unnamed" not in str(p)).strip()
+            for col in t.columns
+        ]
+    return t
+
+
+def _ticker_like_ratio(series: pd.Series) -> float:
+    """Fraction of non-null values in `series` that look like a stock
+    ticker (1-6 uppercase letters, optional .X/-X share-class suffix)."""
+    vals = series.dropna().astype(str).str.strip()
+    if len(vals) == 0:
+        return 0.0
+    matches = vals.map(lambda v: bool(_TICKER_RE.match(v)))
+    return matches.mean()
+
+
 def _find_ticker_table(
     tables: list[pd.DataFrame],
     candidates: tuple[str, ...],
     expected_rows: range | None = None,
     context: str = "",
+    min_ticker_ratio: float = 0.7,
 ) -> tuple[pd.DataFrame, str]:
-    """Search `tables` for one containing a column matching any name in
-    `candidates` (case/whitespace-insensitive), optionally constrained to
-    a plausible row count. Returns (table, matched_column_name).
+    """Find the constituents table and its ticker column using TWO
+    independent signals, since either alone is fragile on Wikipedia:
+      1. Column name matches one of `candidates` (case-insensitive).
+      2. The column's actual cell values look like tickers (regex ratio),
+         which survives multi-level/tuple column headers that break (1).
+    A table is only accepted if its row count is in `expected_rows`
+    (when given) AND at least one column clears `min_ticker_ratio` on the
+    content check -- name matching alone is not trusted, since Wikipedia
+    pages often have more than one table with a plausibly-named column
+    (e.g. a historical "Added/Removed" changes table alongside the actual
+    constituents table).
 
-    On failure, logs every table's shape and column names at INFO level --
-    this is the actual diagnostic you need when Wikipedia renames a column
-    (as happened with the Nasdaq-100 page), so the next failure is visible
-    directly in the workflow log instead of requiring another round trip.
+    On failure, logs every table's shape/columns AND each column's
+    ticker-content ratio at INFO level -- the actual diagnostic needed
+    when a page layout changes again.
     """
     normalized_candidates = {c.strip().lower() for c in candidates}
-    best_match = None
+    flattened = [_flatten_columns(t) for t in tables]
 
-    for t in tables:
-        col_map = {str(c).strip(): str(c).strip() for c in t.columns}
-        for col in col_map:
-            if col.strip().lower() in normalized_candidates:
-                if expected_rows is None or len(t) in expected_rows:
-                    return t, col
-                # Right column name but implausible row count -- keep as a
-                # fallback in case no better match is found.
-                if best_match is None:
-                    best_match = (t, col)
+    def _best_column(t: pd.DataFrame) -> tuple[str, float] | None:
+        best = None
+        for col in t.columns:
+            ratio = _ticker_like_ratio(t[col])
+            name_hint = str(col).strip().lower() in normalized_candidates
+            # Require real content signal; name match alone just breaks ties.
+            if ratio >= min_ticker_ratio and (best is None or ratio > best[1] or
+                                               (ratio == best[1] and name_hint)):
+                best = (col, ratio)
+        return best
 
-    if best_match is not None:
-        logger.warning("%s: matched column but row count was outside the expected "
-                        "range (%d rows) -- using it anyway, verify the result.",
-                        context, len(best_match[0]))
-        return best_match
+    row_count_matches = []
+    for t in flattened:
+        if expected_rows is not None and len(t) not in expected_rows:
+            continue
+        found = _best_column(t)
+        if found:
+            row_count_matches.append((t, found[0], found[1]))
+
+    if row_count_matches:
+        # Prefer the highest ticker-content ratio among tables with a
+        # plausible row count.
+        row_count_matches.sort(key=lambda x: x[2], reverse=True)
+        table, col, ratio = row_count_matches[0]
+        logger.info("%s: matched table (%d rows) on column '%s' (%.0f%% ticker-like)",
+                    context, len(table), col, ratio * 100)
+        return table, col
+
+    # Fall back to content match regardless of row count, so a slightly
+    # off `expected_rows` guess doesn't hard-fail the whole run.
+    any_matches = [(t, *found) for t in flattened if (found := _best_column(t))]
+    if any_matches:
+        any_matches.sort(key=lambda x: x[2], reverse=True)
+        table, col, ratio = any_matches[0]
+        logger.warning("%s: no table matched the expected row count -- using best "
+                        "content match anyway (%d rows, column '%s', %.0f%% ticker-like). "
+                        "Verify the result.", context, len(table), col, ratio * 100)
+        return table, col
 
     logger.info("%s: no matching table found. Tables on the page:", context)
-    for i, t in enumerate(tables):
+    for i, t in enumerate(flattened):
         logger.info("  table[%d]: %d rows, columns=%s", i, len(t), list(t.columns))
+        for col in t.columns:
+            ratio = _ticker_like_ratio(t[col])
+            if ratio > 0:
+                logger.info("    column '%s': %.0f%% ticker-like", col, ratio * 100)
     raise RuntimeError(
         f"Could not locate the {context} constituents table -- page layout has "
-        f"likely changed (tried column names: {candidates}). See the INFO log "
-        f"lines above this error for every table's actual columns on the page; "
-        f"update the `candidates` tuple in src/ingestion/universe.py to match."
+        f"likely changed (tried column names: {candidates}, content-based ticker "
+        f"detection also found nothing above {min_ticker_ratio:.0%}). See the INFO "
+        f"log lines above this error for every table's columns and ticker-content "
+        f"ratios; update src/ingestion/universe.py accordingly."
     )
 
 
