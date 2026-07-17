@@ -74,8 +74,22 @@ GICS_SECTORS = [
 ]
 
 
-def _clean_ticker(t: str) -> str:
-    return t.strip().replace(".", "-")
+def _clean_ticker(t) -> str | None:
+    """Normalize a raw table cell into a ticker string. Returns None for
+    anything that isn't real ticker text (NaN/float cells from malformed
+    or footnote table rows, empty strings) so callers can filter it out
+    instead of crashing -- .map()/.dropna() alone don't guarantee every
+    cell is a clean string; Wikipedia tables occasionally have a stray
+    blank or footnote row that survives to this point as NaN (a float,
+    not a string), which is what caused a bare AttributeError here
+    before this guard existed.
+    """
+    if not isinstance(t, str):
+        return None
+    t = t.strip()
+    if not t:
+        return None
+    return t.replace(".", "-")
 
 
 def fetch_sp500_with_sectors() -> pd.DataFrame:
@@ -87,10 +101,12 @@ def fetch_sp500_with_sectors() -> pd.DataFrame:
             "S&P 500 Wikipedia table is missing expected 'Symbol'/'GICS Sector' "
             f"columns (found: {list(df.columns)}) -- page layout may have changed."
         )
+    df = df.dropna(subset=["Symbol"])
     out = pd.DataFrame({
         "ticker": df["Symbol"].map(_clean_ticker),
         "sector": df["GICS Sector"],
     })
+    out = out.dropna(subset=["ticker"])
     return out.drop_duplicates(subset="ticker").reset_index(drop=True)
 
 
@@ -217,7 +233,8 @@ def fetch_nasdaq100() -> list[str]:
         expected_rows=range(90, 115),  # ~100 components, some share classes
         context="Nasdaq-100",
     )
-    return sorted({_clean_ticker(x) for x in table[col].dropna()})
+    cleaned = {_clean_ticker(x) for x in table[col].dropna()}
+    return sorted(t for t in cleaned if t)
 
 
 def fetch_dow30() -> list[str]:
@@ -229,7 +246,8 @@ def fetch_dow30() -> list[str]:
         expected_rows=range(20, 35),  # DJIA has 30 components
         context="Dow 30",
     )
-    return sorted({_clean_ticker(x) for x in table[col].dropna()})
+    cleaned = {_clean_ticker(x) for x in table[col].dropna()}
+    return sorted(t for t in cleaned if t)
 
 
 def fetch_russell2000() -> list[str]:
