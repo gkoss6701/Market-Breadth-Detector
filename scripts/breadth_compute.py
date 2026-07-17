@@ -1,22 +1,22 @@
 """
-Reads accumulated prices, computes the FULL breadth history (metrics +
-composite score/regime + divergence flags for every date with enough
-lookback), and bulk-upserts all of it into breadth_daily -- not just
-today's row. This is what makes the dashboard's time-series charts have
-data to plot; writing only the latest day per run leaves breadth_daily
-with as few rows as the job has been run, which looks empty even once
-metrics are non-null.
+Computes breadth metrics for EVERY registered index (major + sector), not
+just a single market-wide universe. For each index_key in index_metadata,
+scopes the shared `prices` table down to that index's constituent
+tickers, computes the full history of metrics + composite score/regime +
+divergence flags, and bulk-upserts into breadth_daily tagged with that
+index_key.
 
-Recomputing the whole history each run is more work than strictly
-necessary for a single new day, but at a few hundred tickers x a few
-years of data this is a sub-second-to-low-seconds pandas operation, not
-a real cost -- correctness/simplicity wins here over a more complex
-incremental-append design.
+Recomputing full history per index on every run is the same tradeoff as
+phase 1: more work than a pure incremental append, but simple and
+correct, and still fast at this scale (a few hundred tickers x a few
+years x ~14 indexes is a few seconds of pandas work, not a real cost).
 
-Alerts (regime flip, divergence) still only fire based on the latest day,
-compared against the prior day already in the table.
+Alerts are index-aware -- see src/alerts/twilio_notify.py's
+ALERT_INDEX_KEYS for which indexes actually fire SMS (defaults to sp500
+only, to avoid 14x alert volume from every sector flipping independently).
 
 Run via .github/workflows/breadth_compute.yml, chained after daily_ingest.
+Requires refresh_universe.py and daily_ingest.py to have already run.
 """
 from __future__ import annotations
 
@@ -25,33 +25,36 @@ import logging
 import pandas as pd
 
 from src.alerts.twilio_notify import maybe_alert_divergence, maybe_alert_regime_flip
-from src.db.models import get_connection, get_latest_breadth, init_db, upsert_breadth_daily_bulk
+from src.db.models import (
+    get_connection,
+    get_index_registry,
+    get_latest_breadth,
+    init_db,
+    upsert_breadth_daily_bulk,
+)
 from src.engine.composite import classify_regime, composite_score
 from src.engine.divergence import bearish_divergence, bullish_divergence
 from src.engine.metrics import (
     advance_decline_line,
-    index_close,
     new_highs_lows,
     pct_above_ma,
+    synthetic_index_price,
     up_down_volume_ratio,
 )
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BENCHMARK_TICKER = "SPY"
 
-
-def main():
-    init_db()
-    with get_connection() as conn:
-        prices = pd.read_sql("SELECT * FROM prices", conn, parse_dates=["date"])
-
-    if prices.empty:
-        logger.warning("No price data found; run daily_ingest / backfill_history first.")
-        return
-
-    universe = prices[prices["ticker"] != BENCHMARK_TICKER]
+def compute_history_for_index(prices: pd.DataFrame, index_key: str, tickers: set[str]) -> pd.DataFrame:
+    """Returns the full computed breadth_daily history for one index, or
+    an empty frame if there isn't enough data yet."""
+    universe = prices[prices["ticker"].isin(tickers)]
+    if universe.empty:
+        logger.warning("No price data for index '%s' (0 of %d tickers matched) -- "
+                        "check daily_ingest has run since this index was registered.",
+                        index_key, len(tickers))
+        return pd.DataFrame()
 
     metrics = {
         "pct_above_20ma": pct_above_ma(universe, 20),
@@ -69,11 +72,10 @@ def main():
     )
     regime = classify_regime(score)
 
-    bench = index_close(prices, BENCHMARK_TICKER)
-    bearish = bearish_divergence(bench, score.reindex(bench.index))
-    bullish = bullish_divergence(bench, score.reindex(bench.index))
+    proxy_price = synthetic_index_price(universe)
+    bearish = bearish_divergence(proxy_price, score.reindex(proxy_price.index))
+    bullish = bullish_divergence(proxy_price, score.reindex(proxy_price.index))
 
-    # Build the full history frame, one row per date across all metrics.
     history = pd.DataFrame(metrics)
     history["composite_score"] = score
     history["regime"] = regime
@@ -81,36 +83,71 @@ def main():
     history["bullish_divergence"] = bullish.reindex(history.index).fillna(False)
     history = history.reset_index().rename(columns={"index": "date"})
     history["date"] = pd.to_datetime(history["date"]).dt.date.astype(str)
+    history["index_key"] = index_key
 
-    # Only persist rows where we have at least SOME signal (ad_line always
-    # has a value once there are 2+ days of data; earlier rows before that
-    # are meaningless placeholders and just clutter the table/charts).
+    # Only persist rows with at least some signal (ad_line always has a
+    # value once there are 2+ days of data for that index).
     history = history.dropna(subset=["ad_line"])
+    return history
 
-    if history.empty:
-        logger.warning("Computed history is empty after filtering; nothing to write.")
+
+def main():
+    init_db()
+    registry = get_index_registry()
+    if registry.empty:
+        logger.error("index_metadata is empty -- run scripts/refresh_universe.py first.")
         return
 
-    upsert_breadth_daily_bulk(history)
-    logger.info(
-        "Wrote %d breadth_daily rows (%s to %s)",
-        len(history), history["date"].min(), history["date"].max(),
-    )
+    with get_connection() as conn:
+        prices = pd.read_sql("SELECT * FROM prices", conn, parse_dates=["date"])
+        constituents = pd.read_sql("SELECT * FROM index_constituents", conn)
 
-    # Alerts: compare the latest two rows now in the table. Alerting is
-    # best-effort -- a missing/misconfigured Twilio setup must not crash
-    # this script, because a crash here stops the workflow before the
-    # "Commit updated DB" step runs, silently losing the computed history.
+    if prices.empty:
+        logger.warning("No price data found; run daily_ingest / backfill_history first.")
+        return
+
+    all_histories = []
+    for _, idx_row in registry.iterrows():
+        index_key, label = idx_row["index_key"], idx_row["label"]
+        tickers = set(constituents.loc[constituents["index_key"] == index_key, "ticker"])
+        if not tickers:
+            logger.warning("Index '%s' has no constituents registered -- skipping.", index_key)
+            continue
+
+        history = compute_history_for_index(prices, index_key, tickers)
+        if history.empty:
+            continue
+
+        all_histories.append(history)
+        logger.info("%-32s %-6s %d rows (%s to %s)",
+                    index_key, idx_row["index_type"], len(history),
+                    history["date"].min(), history["date"].max())
+
+    if not all_histories:
+        logger.warning("No index produced computable history; nothing written.")
+        return
+
+    combined = pd.concat(all_histories, ignore_index=True)
+    upsert_breadth_daily_bulk(combined)
+    logger.info("Wrote %d total breadth_daily rows across %d indexes", len(combined), len(all_histories))
+
+    # Alerts: compare latest two rows per index (gated by ALERT_INDEX_KEYS
+    # inside the alert functions -- safe to call for every index).
     try:
-        latest_two = get_latest_breadth(n_days=2)
-        if len(latest_two) >= 2:
+        for _, idx_row in registry.iterrows():
+            index_key, label = idx_row["index_key"], idx_row["label"]
+            latest_two = get_latest_breadth(index_key, n_days=2)
+            if len(latest_two) < 2:
+                continue
             today_row, prior_row = latest_two.iloc[0], latest_two.iloc[1]
-            maybe_alert_regime_flip(today_row["date"], prior_row["regime"], today_row["regime"])
+            maybe_alert_regime_flip(index_key, label, today_row["date"], prior_row["regime"], today_row["regime"])
             if bool(today_row["bearish_divergence"]):
-                maybe_alert_divergence(today_row["date"], "bearish_divergence")
+                maybe_alert_divergence(index_key, label, today_row["date"], "bearish_divergence")
             if bool(today_row["bullish_divergence"]):
-                maybe_alert_divergence(today_row["date"], "bullish_divergence")
+                maybe_alert_divergence(index_key, label, today_row["date"], "bullish_divergence")
     except Exception:
+        # Alerting must never block the DB commit that follows this script
+        # in the workflow -- see phase 1 postmortem on this exact failure mode.
         logger.exception("Alert step failed (Twilio not configured or a send error) -- "
                           "continuing, since breadth_daily was already written successfully.")
 

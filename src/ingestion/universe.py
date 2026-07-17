@@ -1,51 +1,151 @@
 """
-Universe management: which tickers count toward breadth calculations.
+Multi-index universe management. Phase 2: instead of one static ticker
+list, this maintains a registry of indexes -- major (S&P 500, Nasdaq-100,
+Dow 30) and sector (11 GICS sectors, derived from the S&P 500's own sector
+classification) -- each with its own dynamically-fetched current
+constituent list.
 
-IMPORTANT (survivorship bias): for backtesting, using TODAY's constituent
-list applied to historical data silently excludes stocks that were removed
-from the index (usually because they were struggling). This inflates how
-healthy breadth looked historically. `get_current_universe()` is fine for
-live/forward use. For backtests, prefer a point-in-time snapshot if you can
-source one (see NOTE at bottom of file) -- otherwise, document the bias
-rather than ignore it.
+Design choice: sector indexes are NOT a separate data pull. Wikipedia's
+S&P 500 constituents table already includes a "GICS Sector" column per
+company, so sector universes are just that same pull, grouped by sector.
+This keeps sector breadth consistent with the S&P 500 breadth (same
+underlying universe, no separate data source to drift out of sync) and
+avoids needing a second scrape per sector.
+
+IMPORTANT (survivorship bias): all fetchers here return CURRENT
+constituents. Same caveat as phase 1 -- backtesting against years of
+history using today's membership excludes stocks removed from the index,
+which inflates historical breadth readings. See the module-level note at
+the bottom for options if you need point-in-time accuracy.
 """
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
+logger = logging.getLogger(__name__)
+
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+NASDAQ100_WIKI_URL = "https://en.wikipedia.org/wiki/Nasdaq-100"
+DOW30_WIKI_URL = "https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average"
+
+# GICS sector names as they appear in the S&P 500 Wikipedia table.
+GICS_SECTORS = [
+    "Information Technology",
+    "Health Care",
+    "Financials",
+    "Consumer Discretionary",
+    "Communication Services",
+    "Industrials",
+    "Consumer Staples",
+    "Energy",
+    "Utilities",
+    "Real Estate",
+    "Materials",
+]
 
 
-def get_current_universe(source: str = "wikipedia") -> list[str]:
-    """Return the current list of S&P 500 tickers.
+def _clean_ticker(t: str) -> str:
+    return t.strip().replace(".", "-")
 
-    Free/decent accuracy source. Good enough for live/forward-looking use;
-    see module docstring for backtesting caveats.
-    """
-    if source != "wikipedia":
-        raise ValueError(f"Unsupported source: {source}")
 
+def fetch_sp500_with_sectors() -> pd.DataFrame:
+    """Returns DataFrame [ticker, sector] for the current S&P 500."""
     tables = pd.read_html(SP500_WIKI_URL)
     df = tables[0]
-    tickers = df["Symbol"].str.replace(".", "-", regex=False).tolist()
-    return sorted(set(tickers))
+    out = pd.DataFrame({
+        "ticker": df["Symbol"].map(_clean_ticker),
+        "sector": df["GICS Sector"],
+    })
+    return out.drop_duplicates(subset="ticker").reset_index(drop=True)
 
 
-def load_universe_from_csv(path: str) -> list[str]:
-    """Load a static, hand-maintained universe file (data/universe.csv,
-    one ticker per line). Recommended for reproducible backtests --
-    freeze the list you tested against rather than re-pulling live."""
-    with open(path) as f:
-        return sorted({line.strip().upper() for line in f if line.strip()})
+def fetch_nasdaq100() -> list[str]:
+    """Returns current Nasdaq-100 constituent tickers."""
+    tables = pd.read_html(NASDAQ100_WIKI_URL)
+    # The constituents table is identified by having a 'Ticker' column;
+    # its position on the page has shifted before, so search for it
+    # rather than hardcoding a table index.
+    for t in tables:
+        cols = {c.strip() for c in t.columns.astype(str)}
+        if "Ticker" in cols:
+            return sorted({_clean_ticker(x) for x in t["Ticker"].dropna()})
+    raise RuntimeError("Could not locate Nasdaq-100 constituents table on Wikipedia page "
+                        "-- page layout may have changed, inspect NASDAQ100_WIKI_URL manually.")
 
 
-# NOTE on point-in-time constituents for unbiased backtesting:
-# Free sources for historical S&P 500 membership are limited. Options,
-# roughly in order of effort/cost:
-#   1. Accept survivorship bias, document it in backtest reports.
-#   2. Use a community-maintained historical membership CSV (search
-#      "S&P 500 historical constituents csv" -- quality varies, verify).
-#   3. Pay for point-in-time index membership (Polygon.io, Norgate Data,
-#      CRSP) once you're validating a strategy you intend to trade live.
-# For the yfinance prototyping phase, option 1 is acceptable -- just say
-# so explicitly in any backtest output.
+def fetch_dow30() -> list[str]:
+    """Returns current Dow Jones Industrial Average constituent tickers."""
+    tables = pd.read_html(DOW30_WIKI_URL)
+    for t in tables:
+        cols = {c.strip() for c in t.columns.astype(str)}
+        if "Symbol" in cols and len(t) in range(25, 35):  # DJIA has 30 components
+            return sorted({_clean_ticker(x) for x in t["Symbol"].dropna()})
+    raise RuntimeError("Could not locate Dow 30 constituents table on Wikipedia page "
+                        "-- page layout may have changed, inspect DOW30_WIKI_URL manually.")
+
+
+def fetch_russell2000() -> list[str]:
+    """Not implemented: no reliable free source for the full, current
+    ~2000-ticker Russell 2000 constituent list. Wikipedia does not
+    maintain a complete member list, and most free APIs cap constituent
+    endpoints. Options if you need this:
+      - iShares IWM ETF holdings CSV (ishares.com publishes daily holdings
+        for its own funds without an API key) -- format changes
+        periodically, would need its own parser.
+      - A paid data vendor (Polygon.io, Norgate) with an index membership
+        endpoint.
+    Left unimplemented rather than silently returning a wrong/partial list.
+    """
+    raise NotImplementedError(
+        "Russell 2000 constituent list has no reliable free full source. "
+        "See function docstring for options."
+    )
+
+
+# Registry: index_key -> metadata + fetch function. index_key is what's
+# stored in breadth_daily.index_key and shown in the dashboard selector.
+def _sector_index_key(sector_name: str) -> str:
+    return "sector_" + sector_name.lower().replace(" ", "_")
+
+
+MAJOR_INDEXES = {
+    "sp500": {"label": "S&P 500", "type": "major", "fetch": lambda: fetch_sp500_with_sectors()["ticker"].tolist()},
+    "nasdaq100": {"label": "Nasdaq-100", "type": "major", "fetch": fetch_nasdaq100},
+    "dow30": {"label": "Dow Jones Industrial Average", "type": "major", "fetch": fetch_dow30},
+    # "russell2000" intentionally omitted -- see fetch_russell2000 docstring.
+}
+
+
+def build_full_registry() -> dict[str, dict]:
+    """Builds the complete index registry, including sector indexes
+    derived from the S&P 500 pull. Sector fetchers are closures over a
+    single shared S&P 500 pull so we don't re-fetch Wikipedia once per
+    sector -- call this once, then use registry[key]['tickers'] rather
+    than calling registry[key]['fetch']() repeatedly."""
+    sp500 = fetch_sp500_with_sectors()
+
+    registry = {
+        "sp500": {"label": "S&P 500", "type": "major", "tickers": sp500["ticker"].tolist()},
+        "nasdaq100": {"label": "Nasdaq-100", "type": "major", "tickers": fetch_nasdaq100()},
+        "dow30": {"label": "Dow Jones Industrial Average", "type": "major", "tickers": fetch_dow30()},
+    }
+
+    for sector in GICS_SECTORS:
+        key = _sector_index_key(sector)
+        tickers = sp500.loc[sp500["sector"] == sector, "ticker"].tolist()
+        if not tickers:
+            logger.warning("No S&P 500 tickers found for sector '%s' -- check GICS_SECTORS "
+                            "spelling still matches Wikipedia's current column values.", sector)
+            continue
+        registry[key] = {"label": f"Sector: {sector}", "type": "sector", "tickers": tickers}
+
+    return registry
+
+
+# NOTE on point-in-time constituents for unbiased backtesting: see phase 1
+# note (unchanged) -- free sources give current membership only. Accept
+# survivorship bias for prototyping, document it in any backtest report,
+# or pay for point-in-time membership (Polygon.io, Norgate, CRSP) before
+# trusting a backtest for live decisions.

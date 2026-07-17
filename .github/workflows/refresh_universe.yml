@@ -1,0 +1,31 @@
+name: Refresh Universe (weekly)
+
+on:
+  schedule:
+    - cron: "0 12 * * 6"  # Saturday noon UTC -- markets closed, low urgency
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Refresh index constituents
+        env:
+          BREADTH_DB_PATH: data/breadth.db
+        run: python -m scripts.refresh_universe
+      - name: Commit updated DB
+        run: |
+          git config user.name "breadth-bot"
+          git config user.email "breadth-bot@users.noreply.github.com"
+          git add -f data/breadth.db
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "Refresh index universe $(date -u +%Y-%m-%d)"
+          git push

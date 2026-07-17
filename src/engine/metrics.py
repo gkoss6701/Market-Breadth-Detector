@@ -56,8 +56,21 @@ def up_down_volume_ratio(df: pd.DataFrame) -> pd.Series:
     return ratio
 
 
-def index_close(df: pd.DataFrame, index_ticker: str = "SPY") -> pd.Series:
-    """Convenience accessor for a benchmark's close series, e.g. for
-    divergence comparisons. Assumes index_ticker is present in df."""
-    sub = df[df["ticker"] == index_ticker].sort_values("date")
-    return sub.set_index("date")["close"].rename("index_close")
+def synthetic_index_price(df: pd.DataFrame) -> pd.Series:
+    """Equal-weighted synthetic index price for divergence comparisons.
+
+    Phase 2 note: indexes here (S&P 500, sector groups, etc.) are defined
+    by their constituent stock lists, not by a single tradeable ticker
+    (unlike phase 1, which used SPY as a stand-in). There's no single
+    'price' column to compare breadth against, so this builds one:
+    normalize each ticker's close to 100 at its first available date,
+    then average across the universe each day. This is a proxy for "how
+    is this index's price behaving," not an official cap-weighted index
+    value -- adequate for spotting price/breadth divergences, not for
+    precise index-level return calculations.
+    """
+    df = df.sort_values(["ticker", "date"])
+    normalized = df.groupby("ticker")["close"].transform(lambda s: s / s.iloc[0] * 100)
+    out = normalized.groupby(df["date"]).mean()
+    out.name = "synthetic_index_price"
+    return out

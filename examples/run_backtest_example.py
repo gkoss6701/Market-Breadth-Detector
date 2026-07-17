@@ -3,9 +3,10 @@ End-to-end example: pull a small universe via yfinance, compute breadth
 metrics, build the composite regime signal, and backtest a breakout signal
 filtered by regime.
 
-Deliberately uses a SMALL universe (~30 tickers) for a fast first run.
-Swap in the full S&P 500 list (src/ingestion/universe.py) once this runs
-clean end to end -- validate the pipeline on a small set before scaling up.
+Deliberately uses a SMALL, hardcoded universe (~30 tickers) for a fast,
+self-contained run -- unaffected by the phase 2 multi-index DB pipeline.
+For the full multi-index registry (S&P 500, Nasdaq-100, Dow 30, 11 sector
+indexes), see src/ingestion/universe.py's build_full_registry().
 
 Run: python -m examples.run_backtest_example
 """

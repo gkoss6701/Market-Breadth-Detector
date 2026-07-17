@@ -9,8 +9,7 @@ from src.backtest.optimize import evaluate_on_holdout, optimize_weights
 from src.backtest.runner import forward_returns
 from src.backtest.signals import breakout_signal
 from src.engine.composite import classify_regime, composite_score
-from src.engine.metrics import advance_decline_line, pct_above_ma
-from src.engine.sector_breadth import compute_sector_breadth, sector_relative_strength
+from src.engine.metrics import advance_decline_line, pct_above_ma, synthetic_index_price
 
 
 def _toy_universe():
@@ -60,18 +59,39 @@ def test_composite_score_and_regime_run():
     assert set(regime.dropna().unique()) <= {"risk_on", "neutral", "weak", "risk_off", "unknown"}
 
 
-def _toy_sector_map():
-    return pd.DataFrame({"ticker": ["A", "B"], "sector": ["Tech", "Tech"]})
-
-
-def test_sector_breadth_runs_and_ranks():
+def test_synthetic_index_price_no_lookahead():
     df = _toy_universe()
-    sector_map = _toy_sector_map()
-    sb = compute_sector_breadth(df, sector_map, ma_window=3)
-    assert not sb.empty
-    assert set(sb["sector"].unique()) == {"Tech"}
-    ranked = sector_relative_strength(sb)
-    assert "rank" in ranked.columns
+    proxy = synthetic_index_price(df)
+    cutoff = df["date"].unique()[5]
+    truncated = df[df["date"] <= cutoff]
+    proxy_truncated = synthetic_index_price(truncated)
+    pd.testing.assert_series_equal(
+        proxy.loc[:cutoff], proxy_truncated, check_names=False
+    )
+
+
+def test_compute_history_for_index_multi_index():
+    """A single price table, scoped to two different (possibly
+    overlapping) ticker sets, should produce independent breadth
+    histories -- this is the core phase-2 behavior."""
+    from scripts.breadth_compute import compute_history_for_index
+
+    df = _toy_universe()  # tickers A (rising) and B (falling)
+    hist_a_only = compute_history_for_index(df, "index_a", {"A"})
+    hist_both = compute_history_for_index(df, "index_both", {"A", "B"})
+
+    assert not hist_a_only.empty
+    assert not hist_both.empty
+    assert (hist_a_only["index_key"] == "index_a").all()
+    assert (hist_both["index_key"] == "index_both").all()
+    # A-only universe's A/D line should differ from the mixed A+B universe's
+    # (A alone only ever advances, so its A/D line strictly increases;
+    # A+B mixed nets out closer to flat) -- confirms each index_key's
+    # history is actually scoped to its own ticker set, not shared state.
+    a_only_ad = hist_a_only.set_index("date")["ad_line"]
+    both_ad = hist_both.set_index("date")["ad_line"]
+    common_dates = a_only_ad.index.intersection(both_ad.index)
+    assert (a_only_ad.loc[common_dates] != both_ad.loc[common_dates]).any()
 
 
 def test_optimize_weights_never_sees_holdout():
