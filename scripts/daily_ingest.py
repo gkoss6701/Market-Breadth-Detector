@@ -6,7 +6,7 @@ fetched once) and upserts into the prices table.
 Requires index_constituents to already be populated -- run
 scripts/refresh_universe.py at least once first.
 
-Run via .github/workflows/daily_ingest.yml.
+Run via nas/daily_pipeline.sh (see NAS_SETUP.md).
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import datetime as dt
 import logging
 
 from src.db.models import get_all_universe_tickers, init_db, upsert_prices
-from src.ingestion.yfinance_client import fetch_bulk_ohlcv
+from src.ingestion.eodhd_client import fetch_bulk_ohlcv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,7 +33,7 @@ def main():
     start = (dt.date.today() - dt.timedelta(days=LOOKBACK_DAYS)).isoformat()
 
     logger.info("Fetching %d tickers (union across all indexes) from %s", len(tickers), start)
-    df = fetch_bulk_ohlcv(tickers, start=start, batch_size=50)
+    df = fetch_bulk_ohlcv(tickers, start=start)
     logger.info("Fetched %d rows", len(df))
 
     upsert_prices(df)

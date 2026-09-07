@@ -7,14 +7,18 @@ and price/breadth divergence detection -- **independently for every major
 index and sector index**, not just one market-wide read.
 
 Structured the same way as the Central Ohio Kayak Dashboard: scheduled
-ingestion (GitHub Actions) -> compute -> persist (SQLite) -> Streamlit
-dashboard + Twilio alerts.
+ingestion -> compute -> persist (SQLite) -> Streamlit dashboard + Pushover
+alerts. Runs as Docker containers on a local NAS (QNAP), scheduled via
+the NAS's own Task Scheduler rather than GitHub Actions -- see
+[NAS_SETUP.md](NAS_SETUP.md) for the full deployment guide. GitHub now
+holds code only, no automation and no committed database.
 
 ## Status
 
-Phase 2: multi-index. Prototyping on `yfinance`. Not yet validated for
-live trading decisions -- see `Backtesting caveats` below before trusting
-any regime signal with real capital.
+Phase 2: multi-index. Price data comes from EODHD (see `Data source`
+below). Not yet validated for live trading decisions -- see
+`Backtesting caveats` below before trusting any regime signal with real
+capital.
 
 ## What's new in Phase 2
 
@@ -22,8 +26,9 @@ Phase 1 tracked one hand-picked ~30-ticker universe. Phase 2 replaces
 that with a **registry of indexes**, each with its own dynamically-fetched
 current constituent list and its own independent breadth history:
 
-- **Major indexes**: S&P 500, Nasdaq-100, Dow Jones Industrial Average
-  (Russell 2000 is *not* included -- see caveat below).
+- **Major indexes**: S&P 500, Nasdaq-100, Dow Jones Industrial Average,
+  S&P 400 (Mid Cap), S&P 600 (Small Cap), Russell 1000, Russell 2000,
+  Russell 3000.
 - **Sector indexes**: all 11 GICS sectors (Information Technology, Health
   Care, Financials, Consumer Discretionary, Communication Services,
   Industrials, Consumer Staples, Energy, Utilities, Real Estate,
@@ -33,12 +38,16 @@ current constituent list and its own independent breadth history:
   own composite score, regime, and charts, plus a cross-index summary
   table showing every index's latest snapshot at once.
 
-**Russell 2000 is not implemented.** There is no reliable free source for
-the full, current ~2000-ticker constituent list (Wikipedia doesn't
-maintain a complete member list, and free APIs cap constituent
-endpoints). See `fetch_russell2000()` in `src/ingestion/universe.py` for
-the specific options (iShares IWM holdings CSV, or a paid vendor) if you
-want to add it.
+**Russell 1000/2000/3000 source note.** Neither Wikipedia nor SlickCharts
+publishes a full Russell constituent list (checked both directly).
+ChartMill.com does, sourced from its JSON REST API rather than scraping
+its (JS-rendered) page HTML -- see `_fetch_chartmill_index_tickers()` in
+`src/ingestion/universe.py` for how, and the one open question: whether
+ChartMill's Cloudflare protection permits unattended requests the way
+this runs on the NAS (confirmed working live from a browser session,
+not yet from a headless scheduled run). If it ever gets blocked, the
+fetch fails loudly rather than silently returning a wrong list -- see the
+exception message for next steps.
 
 **Schema change / migration**: `breadth_daily`'s primary key changed from
 `(date)` to `(index_key, date)`, and two new tables were added
@@ -53,27 +62,37 @@ There's now a dependency before ingestion can even start: the index
 registry has to exist before `daily_ingest`/`backfill_history` know which
 tickers to pull.
 
-1. **Refresh Universe** (Actions tab, `workflow_dispatch`) -- or locally:
-   `python -m scripts.refresh_universe`. Populates `index_constituents` /
-   `index_metadata` for every major + sector index.
-2. **Backfill History** (`workflow_dispatch`, default 2 years) -- or
-   locally: `python -m scripts.backfill_history --years 2`. Pulls OHLCV
-   for the full union of tickers across every index. This is a bigger
-   pull than phase 1 (~500-600 unique tickers vs. ~30) -- expect several
-   minutes and occasional yfinance rate-limit retries.
-3. **Breadth Compute** (`workflow_dispatch`) -- or locally:
-   `python -m scripts.breadth_compute`. Computes full history for every
-   registered index in one pass.
-4. From here on: **Daily Ingest** -> **Breadth Compute** (chained
-   automatically) keeps everything current. **Refresh Universe** runs on
-   its own weekly schedule (constituent lists change rarely, no need to
-   re-pull daily).
+1. **Refresh Universe**: `python -m scripts.refresh_universe` (or, on the
+   NAS, part of `nas/first_time_setup.sh`). Populates
+   `index_constituents` / `index_metadata` for every major + sector index.
+2. **Backfill History** (default 2 years): `python -m
+   scripts.backfill_history --years 2`. Pulls OHLCV for the full union of
+   tickers across every index. This is a bigger pull than phase 1 (~3,000
+   unique tickers vs. ~30, dominated by the Russell 3000 -- S&P 400/600
+   are largely distinct from the S&P 500 by construction, not a subset the
+   way sectors are, but mostly overlap with the Russell indexes) --
+   expect several minutes via EODHD (one API call per ticker, run
+   concurrently; see `Data source` below).
+3. **Breadth Compute**: `python -m scripts.breadth_compute`. Computes
+   full history for every registered index in one pass.
+4. From here on (on the NAS): **Daily Ingest** -> **Breadth Compute**
+   run in sequence via `nas/daily_pipeline.sh`, scheduled by NAS Task
+   Scheduler. **Refresh Universe** runs on its own weekly schedule via
+   `nas/weekly_refresh.sh` (constituent lists change rarely, no need to
+   re-pull daily). See [NAS_SETUP.md](NAS_SETUP.md) for the full setup.
 
 Skipping step 1 means `daily_ingest`/`backfill_history` find
 `index_constituents` empty and exit with a clear error rather than
 silently doing nothing.
 
 ## Quickstart
+
+**Running this for real (NAS/Docker)**: see [NAS_SETUP.md](NAS_SETUP.md)
+for the full QNAP + Container Station deployment guide -- that's the
+supported way to run this continuously with scheduled updates.
+
+**Local development** (editing code, running tests, poking at the
+dashboard without Docker):
 
 ```bash
 pip install -r requirements.txt
@@ -97,12 +116,13 @@ streamlit run dashboard/streamlit_app.py
 ## Architecture
 
 ```
-src/ingestion/   -- data pulls: yfinance client + index registry (universe.py)
+src/ingestion/   -- data pulls: EODHD client + index registry (universe.py)
 src/engine/      -- breadth metrics, composite score, divergence detection
 src/backtest/    -- signal generators, walk-forward harness, weight optimizer
 src/db/          -- SQLite schema + access layer (multi-index aware)
-src/alerts/      -- Twilio SMS notifications (per-index, gated by ALERT_INDEX_KEYS)
-scripts/         -- entry points run by GitHub Actions
+src/alerts/      -- Pushover notifications (per-index, gated by ALERT_INDEX_KEYS)
+nas/             -- shell scripts QNAP Task Scheduler invokes (see NAS_SETUP.md)
+scripts/         -- entry points the nas/ scripts call
 dashboard/       -- Streamlit app with index selector
 examples/        -- standalone runnable walkthrough (single-index, unaffected by phase 2)
 tests/           -- lookahead-safety, metric sanity, and multi-index scoping checks
@@ -117,23 +137,95 @@ tests/           -- lookahead-safety, metric sanity, and multi-index scoping che
   pull backs both the `sp500` index AND all 11 sector indexes (sector
   indexes are just this same data grouped by sector, not a separate
   scrape).
-- `fetch_nasdaq100()` / `fetch_dow30()` -- separate Wikipedia pages,
-  located by searching for the table with the expected ticker column
-  rather than a hardcoded table index (Wikipedia table ordering on a page
-  can shift).
+- `fetch_dow30()` -- a separate Wikipedia article,
+  [`List_of_Dow_Jones_Industrial_Average_companies`](https://en.wikipedia.org/wiki/List_of_Dow_Jones_Industrial_Average_companies)
+  (the main `Dow_Jones_Industrial_Average` page itself dropped its
+  component table at some point and now only has historical annual
+  returns -- the code was still pointed at that page until this was
+  fixed).
+- `fetch_nasdaq100()` / `fetch_sp400()` / `fetch_sp600()` -- SlickCharts
+  (`slickcharts.com/nasdaq100`, `/sp400`, `/sp600`), not Wikipedia.
+  Wikipedia's Nasdaq-100 page no longer carries a per-company table at
+  all (checked directly: only sector-weight percentages and
+  historical-return tables remain, and there's no separate "List of
+  Nasdaq-100 companies" article the way there is for the Dow), and
+  Wikipedia has no equivalent page for S&P 400/600 at all. All three
+  share `_fetch_slickcharts_index()`. SlickCharts is a third-party site,
+  not an official index source -- same caveat as the EODHD-vs-Wikipedia
+  choice below, don't treat it as guaranteed-stable.
+- `fetch_russell1000()` / `fetch_russell2000()` / `fetch_russell3000()`
+  -- ChartMill.com, via its JSON REST API rather than scraping the page
+  HTML (ChartMill's page is a JS-rendered SPA; a plain `requests.get()`
+  on the page URL itself would return an empty shell). All three share
+  `_fetch_chartmill_index_tickers()`: resolve the index's numeric id from
+  its URL slug, then page through its member list. See the
+  `CHARTMILL_BASE_URL` comment in `src/ingestion/universe.py` for the one
+  open question (unattended-request behavior against ChartMill's
+  Cloudflare protection).
 
-Each fetcher raises a clear `RuntimeError` with guidance if Wikipedia's
-page layout changes and the expected table can't be found, rather than
-silently returning an empty/wrong list.
+All seven scraped/API fetchers validate the result count against an
+`expected_rows` range and raise a clear error with guidance if it falls
+outside that range or the expected shape isn't found, rather than
+silently returning an empty/wrong list. The four Wikipedia/SlickCharts
+fetchers locate their table by searching for the expected ticker column
+rather than a hardcoded table index (source page table ordering can
+shift) -- though as of Sept 2026 that guard had a gap: a table with a
+purely numeric column (e.g. a "Year" column of 4-digit years) could
+score as "ticker-like" under the content-based fallback check and get
+picked by mistake instead of raising. The ticker-detection regex now
+requires at least one letter to close that gap.
+
+### Constituent base/fallback lists (`constituents/`)
+
+All eight major sources (S&P 500 w/ sector, Dow 30, Nasdaq-100, S&P 400,
+S&P 600, Russell 1000, Russell 2000, Russell 3000) each have a
+git-tracked CSV snapshot in `constituents/` -- see
+`constituents/README.md` for the exact contract. Short version:
+`build_full_registry()` writes each source's fresh list to its CSV on a
+successful pull, and reads the existing CSV instead (without touching
+it) if the live pull fails, so one bad scrape never deletes or
+overwrites the last known-good list -- it just means that source stays
+at its previous state for one more weekly refresh cycle, logged as a
+warning rather than aborting the whole registry build. This also fixed
+a pre-existing issue where any single fetcher failing used to abort
+`build_full_registry()` entirely, discarding sources that *had*
+refreshed successfully in the same run.
+
+The three Russell/ChartMill sources carry one extra open caveat beyond
+the other five: it's unconfirmed whether ChartMill's Cloudflare
+protection tolerates unattended scripted requests from the NAS the way
+it did from the interactive browser session used to build the base
+files -- if it starts blocking, Russell refreshes just keep falling back
+to the cached files (logged as a warning each run) rather than breaking
+anything, same as any other source hitting this fallback path.
+
+In Docker, `constituents/` is mounted as a volume (`./constituents:/app/constituents`
+in `docker-compose.yml`), not just baked into the image -- otherwise a
+successful cache write from inside a `docker compose run --rm pipeline
+...` invocation would be lost the instant that container is removed,
+which is every pipeline run.
 
 ## Data source
 
-Starting on `yfinance` (free) for prototyping. Known limitations:
-batches rather than true bulk pulls, occasional missing rows, rate limits
-at this scale (~500-600 tickers). Swap `src/ingestion/yfinance_client.py`
-for a Polygon.io or Tiingo bulk-endpoint client once the engine/backtest
-logic is validated and you need daily production reliability at full
-multi-index scale.
+OHLCV comes from EODHD (`src/ingestion/eodhd_client.py`), not yfinance.
+Requires `EODHD_API_KEY` in the environment (see `.env.example`) --
+yfinance needed no API key at all, so this is a new required setup step.
+One HTTP call per ticker (EODHD's plan here doesn't include a bulk
+multi-ticker historical-price endpoint), run concurrently
+(`max_workers`, default 10) since the full multi-index universe is a few
+thousand tickers; each call returns adjusted-close alongside raw OHLCV,
+and `close` is set to the adjusted value so moving averages/new-highs
+don't show a fake "crash" on every split -- same reasoning as yfinance's
+old `auto_adjust=True`. This replaced yfinance specifically because it
+lacked a true bulk endpoint and had frequent rate-limit/partial-failure
+behavior at ~500-600 ticker scale; EODHD's daily request quota has
+enormous headroom at this project's scale by comparison. Constituent
+lists still come from Wikipedia/SlickCharts scraping (see above), not
+EODHD -- EODHD's official index-constituents endpoint
+(`mp_index_components`) is a separate Marketplace add-on this project's
+current plan doesn't include (confirmed via a live 403), so switching to
+it would mean either upgrading that plan or keeping the scraped sources
+as-is.
 
 **Survivorship bias**: every index fetcher returns *current* constituents.
 Backtesting with today's membership against years of history excludes
@@ -172,44 +264,71 @@ before trusting a backtest for live decisions.
 
 ## Infrastructure
 
-Three workflows now, each with a clear dependency order:
+Runs entirely on a local NAS via Docker (`Dockerfile` +
+`docker-compose.yml`), scheduled by the NAS's own task scheduler rather
+than GitHub Actions. Full deployment walkthrough: **[NAS_SETUP.md](NAS_SETUP.md)**.
+Short version:
 
-- `.github/workflows/refresh_universe.yml` -- weekly (Saturday), pulls
-  current constituents for every index. Also runnable on demand.
-- `.github/workflows/daily_ingest.yml` -- pulls prior day's OHLCV for the
-  full multi-index ticker union, commits updated SQLite DB. Runs ~4:30pm
-  ET on weekdays.
-- `.github/workflows/breadth_compute.yml` -- chained after ingestion,
-  computes metrics/regime for every index in one pass, fires Twilio
-  alerts on regime flips or new divergence flags (deduped via
-  `alerts_sent`, gated by `ALERT_INDEX_KEYS`).
+- `docker compose up -d dashboard` -- always-on Streamlit UI
+  (`restart: unless-stopped`), reachable at `http://<nas-ip>:8501`.
+- `docker compose run --rm pipeline bash nas/daily_pipeline.sh` -- runs
+  `daily_ingest` then `breadth_compute` in sequence. Scheduled via NAS
+  Task Scheduler, weekdays after US market close.
+- `docker compose run --rm pipeline bash nas/weekly_refresh.sh` -- runs
+  `refresh_universe`. Scheduled weekly (constituent lists change
+  infrequently).
+- `nas/first_time_setup.sh` -- one-time chain of
+  refresh -> backfill -> compute, run manually before the schedule kicks in.
 
-Kept as separate workflows so failures at each stage are easy to isolate.
+Both scheduled scripts fail fast and loudly (non-zero exit) and send a
+best-effort Pushover notification on failure, so a broken run doesn't
+sit unnoticed.
 
-### Required GitHub Actions secrets (for Twilio alerts)
+### Required secrets (for Pushover alerts)
 
-`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`,
-`ALERT_TO_NUMBER`
+Set in a local `.env` file on the NAS (see `.env.example`), not GitHub
+secrets -- nothing runs on GitHub anymore: `MARKET_BREADTH_PUSHOVER_API`
+(your Pushover application token) and `PUSHOVER_KEY`
+(your Pushover user key) -- both from https://pushover.net.
 
 ### Alert scope (`ALERT_INDEX_KEYS`)
 
-With 14 indexes (3 major + 11 sector) computed daily, alerting on every
+With 19 indexes (8 major + 11 sector) computed daily, alerting on every
 single regime flip would be noisy. `ALERT_INDEX_KEYS` (env var,
 comma-separated index_keys, e.g. `sp500,nasdaq100`) controls which
-indexes actually fire SMS. Defaults to `sp500` only. Every index still
-gets its regime/divergence computed and stored regardless -- this only
-gates the SMS, not the data, so the dashboard always shows everything
-even if you only get texted about the S&P 500.
+indexes actually fire a Pushover notification. Defaults to `sp500` only.
+Every index still gets its regime/divergence computed and stored
+regardless -- this only gates the notification, not the data, so the
+dashboard always shows everything even if you only get pinged about the
+S&P 500.
+
+### Data persistence and backups
+
+`data/breadth.db` lives on the NAS disk (mounted into both containers via
+the `./data` volume in `docker-compose.yml`) -- it's no longer committed
+to git the way the old GitHub Actions setup committed it after every run
+(that was a workaround for Actions runners being ephemeral; the NAS disk
+is genuinely persistent, so it isn't needed here). Make sure `data/` is
+covered by whatever backup/snapshot routine you already run on the NAS --
+it's the only copy of your breadth history now.
+
+`constituents/*.csv` is the opposite case: it IS committed to git (ships
+with the repo as a current base snapshot) AND mounted as a volume
+(`./constituents`), so weekly `refresh_universe` writes on the NAS
+persist across pipeline runs instead of being baked-image dead weight.
+See [Constituent base/fallback lists](#constituent-basefallback-lists-constituents)
+above.
 
 ### Scaling beyond SQLite
 
-SQLite is fine for solo/local use and is what the Actions workflows commit
-back to the repo. Multi-index scale (~500-600 tickers, 14 indexes x ~2
-years of daily rows) is still comfortably within SQLite's range. If you
-hit file-locking issues running the dashboard and the Action
-concurrently, or want a shorter refresh cycle than daily, move to
-Postgres (Supabase free tier is low-friction) -- the schema in
-`src/db/schema.sql` is Postgres-compatible as written.
+SQLite is fine for solo/local use on a NAS. Multi-index scale
+(~3,000 tickers, 19 indexes x ~2 years of daily rows) is still
+comfortably within SQLite's range. If you hit file-locking issues running
+the dashboard and
+a scheduled pipeline run concurrently, or want a shorter refresh cycle
+than daily, move to Postgres (a small Postgres container alongside these
+two, or Supabase's free tier) -- the schema in `src/db/schema.sql` is
+Postgres-compatible as written.
 
 ## Weight/threshold validation (`src/backtest/optimize.py`)
 
@@ -235,11 +354,18 @@ to compensate.
 
 - Validate composite weights/regime thresholds per-index (not just
   market-wide) once enough real history has accumulated via the daily
-  workflows.
-- Swap yfinance for a bulk vendor (Polygon.io/Tiingo) to handle the full
-  multi-index ticker union more reliably at scale.
-- Consider adding Russell 2000 via a paid data source if small-cap
-  breadth becomes relevant to your trading.
+  pipeline.
+- Consider upgrading the EODHD plan to include the Marketplace
+  `mp_index_components` endpoint -- would replace the Wikipedia/SlickCharts/
+  ChartMill scraping in `src/ingestion/universe.py` with a single official,
+  vendor-maintained source across 100+ indexes. Not urgent now that Russell
+  1000/2000/3000 are covered via ChartMill, but would remove the one open
+  question there (unattended-request behavior against ChartMill's
+  Cloudflare protection -- see the `Russell 1000/2000/3000 source note`
+  above) and consolidate four scrape targets into one paid API.
+- Confirm the ChartMill-sourced Russell fetchers actually succeed on a
+  real unattended NAS run (`nas/weekly_refresh.sh`) rather than only from
+  a live browser session -- see the source note above.
 - Sector relative-strength ranking (which sectors are leading/lagging
   right now) is available via the dashboard's cross-index summary table;
   a dedicated rotation view (e.g. a rank-over-time chart) is a natural

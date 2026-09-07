@@ -1,11 +1,19 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 .venv/
 venv/
-# data/breadth.db is intentionally committed by the GitHub Actions
-# workflows (daily_ingest.yml / breadth_compute.yml) -- do NOT ignore it.
-# Ignore any other stray local db files instead (e.g. scratch/test dbs).
-data/*.db-journal
-data/local_*.db
+
+# NAS deployment: the DB now lives on the NAS disk (mounted into the
+# container via docker-compose.yml's ./data volume), not in git. This is
+# a change from the old GitHub Actions setup, which intentionally
+# committed data/breadth.db on every run because Actions runners are
+# ephemeral and had nowhere else to persist it. That's no longer true
+# here -- the NAS disk *is* the persistent storage -- so the whole
+# data/ directory (db, CSVs, journal files) is ignored now.
+data/
+
+# Secrets (Twilio credentials etc.) -- see .env.example for the template.
 .env
+
 .DS_Store

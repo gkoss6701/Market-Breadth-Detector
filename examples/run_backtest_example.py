@@ -1,5 +1,5 @@
 """
-End-to-end example: pull a small universe via yfinance, compute breadth
+End-to-end example: pull a small universe via EODHD, compute breadth
 metrics, build the composite regime signal, and backtest a breakout signal
 filtered by regime.
 
@@ -23,7 +23,7 @@ from src.engine.metrics import (
     pct_above_ma,
     up_down_volume_ratio,
 )
-from src.ingestion.yfinance_client import fetch_bulk_ohlcv
+from src.ingestion.eodhd_client import fetch_bulk_ohlcv
 
 # Small starter universe -- mega/large caps across sectors, plus SPY as the
 # benchmark/index proxy for the price side of the backtest.
@@ -35,8 +35,8 @@ STARTER_UNIVERSE = [
 
 
 def main():
-    print("Fetching OHLCV via yfinance (this may take a minute)...")
-    df = fetch_bulk_ohlcv(STARTER_UNIVERSE, start="2019-01-01", batch_size=15)
+    print("Fetching OHLCV via EODHD (requires EODHD_API_KEY in the environment)...")
+    df = fetch_bulk_ohlcv(STARTER_UNIVERSE, start="2019-01-01")
     df["date"] = pd.to_datetime(df["date"])
 
     breadth_universe = df[df["ticker"] != "SPY"]  # exclude the benchmark itself

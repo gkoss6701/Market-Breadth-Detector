@@ -11,9 +11,10 @@ phase 1: more work than a pure incremental append, but simple and
 correct, and still fast at this scale (a few hundred tickers x a few
 years x ~14 indexes is a few seconds of pandas work, not a real cost).
 
-Alerts are index-aware -- see src/alerts/twilio_notify.py's
-ALERT_INDEX_KEYS for which indexes actually fire SMS (defaults to sp500
-only, to avoid 14x alert volume from every sector flipping independently).
+Alerts are index-aware -- see src/alerts/pushover_notify.py's
+ALERT_INDEX_KEYS for which indexes actually fire a Pushover notification
+(defaults to sp500 only, to avoid 19x alert volume from every sector
+flipping independently).
 
 Run via .github/workflows/breadth_compute.yml, chained after daily_ingest.
 Requires refresh_universe.py and daily_ingest.py to have already run.
@@ -24,7 +25,7 @@ import logging
 
 import pandas as pd
 
-from src.alerts.twilio_notify import maybe_alert_divergence, maybe_alert_regime_flip
+from src.alerts.pushover_notify import maybe_alert_divergence, maybe_alert_regime_flip
 from src.db.models import (
     get_connection,
     get_index_registry,
@@ -148,7 +149,7 @@ def main():
     except Exception:
         # Alerting must never block the DB commit that follows this script
         # in the workflow -- see phase 1 postmortem on this exact failure mode.
-        logger.exception("Alert step failed (Twilio not configured or a send error) -- "
+        logger.exception("Alert step failed (Pushover not configured or a send error) -- "
                           "continuing, since breadth_daily was already written successfully.")
 
 

@@ -10,13 +10,15 @@ scripts/refresh_universe.py FIRST.
 
 Run: python -m scripts.backfill_history --years 2
 
-Note on scale: the full S&P 500 + Nasdaq-100 + Dow 30 + 11 sectors is
-~500-600 unique tickers (sectors are subsets of the S&P 500, so they add
-little beyond the base ~500 + the non-overlapping Nasdaq-100/Dow names).
-At 2 years of history via yfinance with batching, expect this to take
-several minutes and hit rate limits occasionally -- see
-src/ingestion/yfinance_client.py's batch_size/pause_seconds if you need
-to tune for reliability over speed.
+Note on scale: the full multi-index universe (8 major indexes -- S&P
+500/400/600, Nasdaq-100, Dow 30, Russell 1000/2000/3000 -- + 11 sectors)
+is roughly 3,000 unique tickers, dominated by Russell 3000's own ~2,961
+(sectors are subsets of the S&P 500 and add nothing beyond it; S&P
+400/600 add only a couple dozen names not already in Russell 3000). Each
+ticker is one EODHD API call (see src/ingestion/eodhd_client.py); at this
+scale that's comfortably within a typical EODHD daily request quota, and
+concurrent fetching (max_workers) keeps wall-clock time reasonable even
+though there's no bulk multi-ticker historical-price endpoint on this plan.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ import datetime as dt
 import logging
 
 from src.db.models import get_all_universe_tickers, init_db, upsert_prices
-from src.ingestion.yfinance_client import fetch_bulk_ohlcv
+from src.ingestion.eodhd_client import fetch_bulk_ohlcv
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,9 +49,9 @@ def main():
 
     start = (dt.date.today() - dt.timedelta(days=int(args.years * 365))).isoformat()
 
-    logger.info("Backfilling %d tickers from %s (this can take several minutes at this scale)",
+    logger.info("Backfilling %d tickers from %s (this can take a few minutes at this scale)",
                 len(tickers), start)
-    df = fetch_bulk_ohlcv(tickers, start=start, batch_size=15, pause_seconds=1.5)
+    df = fetch_bulk_ohlcv(tickers, start=start)
     logger.info("Fetched %d rows across %d tickers", len(df), df["ticker"].nunique() if not df.empty else 0)
 
     if df.empty:
