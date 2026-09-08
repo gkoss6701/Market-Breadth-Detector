@@ -42,10 +42,20 @@ cp /app/nas/scheduler.crontab /etc/cron.d/market-breadth
 chmod 644 /etc/cron.d/market-breadth
 chown root:root /etc/cron.d/market-breadth
 
-echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] scheduler starting -- installed crontab:"
+echo "[$(date -u +'%Y-%m-%dT%H:%M:%SZ')] scheduler starting -- container TZ=${TZ:-<unset>}, local time now: $(date), installed crontab:"
 cat /etc/cron.d/market-breadth
 
 # -f: stay in the foreground (PID 1 of this container) instead of
 # daemonizing and exiting, which is what "docker-compose up -d scheduler"
-# needs to keep the container alive.
+# needs to keep the container alive. `exec` (not a plain `cron -f`) so
+# cron directly replaces this process rather than running as its child --
+# this matters because it's this process's own environment (specifically
+# TZ, set via docker-compose.yml's `environment:` on the scheduler
+# service) that the cron DAEMON reads to decide what time it currently
+# is. A `TZ=` line inside nas/scheduler.crontab does NOT do this -- that
+# was tried first and confirmed live to be ignored for scheduling
+# purposes (a job fired at the UTC wall-clock time instead of the
+# intended ET time); it only sets $TZ inside each individual job's own
+# environment, which is a different thing. See the comments in
+# nas/scheduler.crontab and docker-compose.yml for the full story.
 exec cron -f

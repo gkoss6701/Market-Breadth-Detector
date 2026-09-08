@@ -5,14 +5,25 @@
 # + `docker-compose up -d scheduler` to take effect, same as any other
 # code change.
 #
-# TZ is pinned to America/New_York (not the NAS's own local timezone) on
-# purpose: these jobs are timed against the US stock market's schedule,
-# not wherever the NAS physically sits, and pinning to the market's own
-# timezone means the times below stay correct across DST changes
-# automatically (America/New_York's tzdata entry already knows when EDT
-# vs EST applies) -- unlike the old QNAP Task Scheduler setup, which ran
-# in NAS local time and needed a manual re-check every DST change.
-TZ=America/New_York
+# NOT a `TZ=` line here: that was tried first and confirmed broken by a
+# live run that fired at 16:30 UTC (12:30pm ET) instead of 16:30 ET. A
+# `TZ=` assignment inside a cron.d file is only exported into each job's
+# OWN environment -- it does not change what wall-clock time the cron
+# DAEMON itself uses to evaluate the schedule below. The daemon's own
+# clock follows the container's own environment, so the timezone is set
+# via `environment: - TZ=America/New_York` on the `scheduler` service in
+# docker-compose.yml instead (see the comment there) -- that's what
+# actually makes "30 16 * * 1-5" below mean 4:30pm America/New_York, DST
+# included, not a fixed UTC offset that drifts twice a year.
+#
+# PATH= IS a real, working cron.d directive (unlike TZ=) -- explicit here
+# because cron's own default PATH is a bare `/usr/bin:/bin`, which does
+# NOT include /usr/local/bin, where the official python Docker image
+# actually installs `python`/`python3`. Confirmed live: the very first
+# scheduled run failed with "python: command not found" before this line
+# was added, even though python is definitely on the image -- cron's
+# minimal default PATH just couldn't see it.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # /etc/cron.d files require a user field (root) that a personal crontab
 # (`crontab -e`) does not -- don't drop it if you copy these lines

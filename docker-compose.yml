@@ -90,6 +90,19 @@ services:
       - ./constituents:/app/constituents
     environment:
       - BREADTH_DB_PATH=/app/data/breadth.db
+      # This -- not a TZ= line inside nas/scheduler.crontab -- is what
+      # actually controls when the cron jobs fire. Confirmed live (both
+      # on a real cron daemon in testing and on this deployment's first
+      # real run): a TZ= assignment inside a cron.d file is only exported
+      # into each job's own environment, it does NOT change what
+      # wall-clock time the cron daemon itself uses to decide "is it
+      # 16:30 yet" -- that decision uses the process's own environment,
+      # i.e. this variable. Confirmed by a live run firing at 16:30 UTC
+      # (12:30pm ET) instead of 16:30 ET -- the daemon was reading UTC
+      # the whole time. Setting TZ here, on the container cron -f itself
+      # runs in, is what makes "30 16 * * 1-5" in nas/scheduler.crontab
+      # actually mean 4:30pm America/New_York, DST included.
+      - TZ=America/New_York
     env_file:
       - .env
     restart: unless-stopped
