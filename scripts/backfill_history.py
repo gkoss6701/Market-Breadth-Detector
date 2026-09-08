@@ -15,10 +15,17 @@ Note on scale: the full multi-index universe (8 major indexes -- S&P
 is roughly 3,000 unique tickers, dominated by Russell 3000's own ~2,961
 (sectors are subsets of the S&P 500 and add nothing beyond it; S&P
 400/600 add only a couple dozen names not already in Russell 3000). Each
-ticker is one EODHD API call (see src/ingestion/eodhd_client.py); at this
-scale that's comfortably within a typical EODHD daily request quota, and
-concurrent fetching (max_workers) keeps wall-clock time reasonable even
-though there's no bulk multi-ticker historical-price endpoint on this plan.
+ticker is one EODHD API call (see src/ingestion/eodhd_client.py) -- at
+this scale, though, that's enough sustained request volume that EODHD
+will 429 ("Too Many Requests") at the old max_workers=10 concurrency;
+eodhd_client.py now retries a 429 with backoff instead of giving up on
+that ticker immediately, and defaults to max_workers=5 to make hitting
+the limit in the first place less likely. Concurrent fetching still
+keeps wall-clock time reasonable even though there's no bulk
+multi-ticker historical-price endpoint on this plan -- just budget more
+time than a single-threaded pull would suggest, and don't be alarmed by
+occasional "rate-limited ... retrying" warnings in the log; that's the
+retry logic working as intended, not a failure.
 """
 from __future__ import annotations
 

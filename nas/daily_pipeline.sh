@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # Daily pipeline: ingest the latest OHLCV, then recompute breadth metrics
 # for every registered index. This replaces the old daily_ingest.yml /
-# breadth_compute.yml GitHub Actions -- run it via QNAP Task Scheduler,
-# weekdays after US market close:
+# breadth_compute.yml GitHub Actions. Fired automatically, weekdays after
+# US market close, by the `scheduler` docker-compose service's in-container
+# cron (see nas/scheduler.crontab / nas/scheduler_entrypoint.sh) -- no
+# QNAP Task Scheduler configuration needed. Also fine to run manually /
+# on-demand any time:
 #
-#   docker compose run --rm pipeline bash nas/daily_pipeline.sh
+#   docker-compose run --rm pipeline bash nas/daily_pipeline.sh
 #
 # Fails fast (set -e) and loudly: a partial run (ingest succeeded, compute
 # didn't) is worse than an obviously-failed one, so this doesn't try to

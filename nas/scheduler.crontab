@@ -1,0 +1,32 @@
+# Cron schedule for the `scheduler` docker-compose service (see
+# nas/scheduler_entrypoint.sh and NAS_SETUP.md, "Schedule the recurring
+# jobs"). Installed into /etc/cron.d/ at container startup by the
+# entrypoint script -- editing this file requires a `docker-compose build`
+# + `docker-compose up -d scheduler` to take effect, same as any other
+# code change.
+#
+# TZ is pinned to America/New_York (not the NAS's own local timezone) on
+# purpose: these jobs are timed against the US stock market's schedule,
+# not wherever the NAS physically sits, and pinning to the market's own
+# timezone means the times below stay correct across DST changes
+# automatically (America/New_York's tzdata entry already knows when EDT
+# vs EST applies) -- unlike the old QNAP Task Scheduler setup, which ran
+# in NAS local time and needed a manual re-check every DST change.
+TZ=America/New_York
+
+# /etc/cron.d files require a user field (root) that a personal crontab
+# (`crontab -e`) does not -- don't drop it if you copy these lines
+# elsewhere. Each job explicitly invokes `bash -c '...'` (not cron's
+# default /bin/sh) because /etc/environment below is written with bash's
+# `%q` quoting (see scheduler_entrypoint.sh) -- sourcing it under a
+# POSIX /bin/sh (dash on this image) can misparse that quoting.
+
+# Daily Ingest + Compute -- weekdays, 4:30pm ET (30 min after US market
+# close, same buffer the old GitHub Actions cron used).
+30 16 * * 1-5 root bash -c '. /etc/environment && cd /app && bash nas/daily_pipeline.sh' >> /app/logs/cron.log 2>&1
+
+# Weekly Universe Refresh -- Saturdays at 6am ET (markets closed, no
+# urgency, just needs to run sometime before Monday's daily pipeline).
+0 6 * * 6 root bash -c '. /etc/environment && cd /app && bash nas/weekly_refresh.sh' >> /app/logs/cron.log 2>&1
+
+# Cron requires a trailing blank line -- don't remove it.

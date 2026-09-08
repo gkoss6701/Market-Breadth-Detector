@@ -8,8 +8,9 @@ index and sector index**, not just one market-wide read.
 
 Structured the same way as the Central Ohio Kayak Dashboard: scheduled
 ingestion -> compute -> persist (SQLite) -> Streamlit dashboard + Pushover
-alerts. Runs as Docker containers on a local NAS (QNAP), scheduled via
-the NAS's own Task Scheduler rather than GitHub Actions -- see
+alerts. Runs as Docker containers on a local NAS (QNAP), scheduled by an
+in-container cron daemon (a `scheduler` service in docker-compose.yml)
+rather than GitHub Actions or QNAP's own Task Scheduler -- see
 [NAS_SETUP.md](NAS_SETUP.md) for the full deployment guide. GitHub now
 holds code only, no automation and no committed database.
 
@@ -121,7 +122,7 @@ src/engine/      -- breadth metrics, composite score, divergence detection
 src/backtest/    -- signal generators, walk-forward harness, weight optimizer
 src/db/          -- SQLite schema + access layer (multi-index aware)
 src/alerts/      -- Pushover notifications (per-index, gated by ALERT_INDEX_KEYS)
-nas/             -- shell scripts QNAP Task Scheduler invokes (see NAS_SETUP.md)
+nas/             -- shell scripts the `scheduler` service's cron invokes (see NAS_SETUP.md)
 scripts/         -- entry points the nas/ scripts call
 dashboard/       -- Streamlit app with index selector
 examples/        -- standalone runnable walkthrough (single-index, unaffected by phase 2)
@@ -201,7 +202,7 @@ anything, same as any other source hitting this fallback path.
 
 In Docker, `constituents/` is mounted as a volume (`./constituents:/app/constituents`
 in `docker-compose.yml`), not just baked into the image -- otherwise a
-successful cache write from inside a `docker compose run --rm pipeline
+successful cache write from inside a `docker-compose run --rm pipeline
 ...` invocation would be lost the instant that container is removed,
 which is every pipeline run.
 
@@ -212,14 +213,21 @@ Requires `EODHD_API_KEY` in the environment (see `.env.example`) --
 yfinance needed no API key at all, so this is a new required setup step.
 One HTTP call per ticker (EODHD's plan here doesn't include a bulk
 multi-ticker historical-price endpoint), run concurrently
-(`max_workers`, default 10) since the full multi-index universe is a few
+(`max_workers`, default 5) since the full multi-index universe is a few
 thousand tickers; each call returns adjusted-close alongside raw OHLCV,
 and `close` is set to the adjusted value so moving averages/new-highs
 don't show a fake "crash" on every split -- same reasoning as yfinance's
 old `auto_adjust=True`. This replaced yfinance specifically because it
 lacked a true bulk endpoint and had frequent rate-limit/partial-failure
-behavior at ~500-600 ticker scale; EODHD's daily request quota has
-enormous headroom at this project's scale by comparison. Constituent
+behavior at ~500-600 ticker scale. EODHD wasn't immune to the same
+problem once the universe grew past that scale, though: `max_workers`
+was lowered from 10 to 5 after Russell 1000/2000/3000 pushed the full
+union to ~2,987 tickers and 429s started appearing under sustained load
+at the old concurrency -- `_fetch_one` in `eodhd_client.py` now also
+retries a 429 with backoff (honoring `Retry-After` when EODHD sends it)
+instead of treating it as a terminal failure, so a rate-limited ticker
+gets a second chance instead of silently ending up with no data for
+that run. Constituent
 lists still come from Wikipedia/SlickCharts scraping (see above), not
 EODHD -- EODHD's official index-constituents endpoint
 (`mp_index_components`) is a separate Marketplace add-on this project's
@@ -265,20 +273,25 @@ before trusting a backtest for live decisions.
 ## Infrastructure
 
 Runs entirely on a local NAS via Docker (`Dockerfile` +
-`docker-compose.yml`), scheduled by the NAS's own task scheduler rather
-than GitHub Actions. Full deployment walkthrough: **[NAS_SETUP.md](NAS_SETUP.md)**.
+`docker-compose.yml`), scheduled by an in-container cron daemon rather
+than GitHub Actions or QNAP's own Task Scheduler (not every QNAP model
+exposes that). Full deployment walkthrough: **[NAS_SETUP.md](NAS_SETUP.md)**.
 Short version:
 
-- `docker compose up -d dashboard` -- always-on Streamlit UI
+- `docker-compose up -d dashboard` -- always-on Streamlit UI
   (`restart: unless-stopped`), reachable at `http://<nas-ip>:8501`.
-- `docker compose run --rm pipeline bash nas/daily_pipeline.sh` -- runs
-  `daily_ingest` then `breadth_compute` in sequence. Scheduled via NAS
-  Task Scheduler, weekdays after US market close.
-- `docker compose run --rm pipeline bash nas/weekly_refresh.sh` -- runs
-  `refresh_universe`. Scheduled weekly (constituent lists change
-  infrequently).
+- `docker-compose up -d scheduler` -- always-on (`restart: unless-stopped`)
+  cron daemon that fires the two jobs below automatically, pinned to
+  `America/New_York` so it's correct across DST without any NAS-timezone
+  conversion. See `nas/scheduler.crontab` for the exact schedule.
+- `docker-compose run --rm pipeline bash nas/daily_pipeline.sh` -- runs
+  `daily_ingest` then `breadth_compute` in sequence. Fired by `scheduler`
+  weekdays after US market close; also runnable manually any time.
+- `docker-compose run --rm pipeline bash nas/weekly_refresh.sh` -- runs
+  `refresh_universe`. Fired by `scheduler` weekly (constituent lists
+  change infrequently); also runnable manually any time.
 - `nas/first_time_setup.sh` -- one-time chain of
-  refresh -> backfill -> compute, run manually before the schedule kicks in.
+  refresh -> backfill -> compute, run manually before starting `scheduler`.
 
 Both scheduled scripts fail fast and loudly (non-zero exit) and send a
 best-effort Pushover notification on failure, so a broken run doesn't

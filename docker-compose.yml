@@ -1,29 +1,43 @@
-# Two services from one image (see Dockerfile):
+# Three services from one image (see Dockerfile):
 #
 #   dashboard -- always-on Streamlit UI, reachable at http://<nas-ip>:8501.
-#                Starts automatically with `docker compose up -d` and
+#                Starts automatically with `docker-compose up -d` and
 #                restarts on its own if the NAS reboots or the container
 #                crashes (restart: unless-stopped).
 #
-#   pipeline  -- NOT started by `docker compose up`. It carries
+#   pipeline  -- NOT started by `docker-compose up`. It carries
 #                `profiles: [tools]` specifically so it stays out of the
-#                default startup set -- it's meant to be run once per
-#                invocation via QNAP Task Scheduler, e.g.:
-#                  docker compose run --rm pipeline bash nas/daily_pipeline.sh
+#                default startup set -- it's meant to be run on demand,
+#                for manual/one-off invocations, e.g.:
+#                  docker-compose run --rm pipeline bash nas/daily_pipeline.sh
 #                A container that runs to completion and exits is normal
 #                here, not a crash -- don't add restart: to this service.
 #
-# Both services share the same ./data volume (the SQLite DB + CSVs) so
+#   scheduler -- always-on, fires nas/daily_pipeline.sh and
+#                nas/weekly_refresh.sh automatically on the schedule in
+#                nas/scheduler.crontab (via an in-container cron daemon --
+#                see nas/scheduler_entrypoint.sh). This replaces QNAP Task
+#                Scheduler as the way the recurring jobs get scheduled:
+#                some QNAP models don't expose Control Panel -> System ->
+#                Task Scheduler -> Create -> User Defined Script at all,
+#                and this runs identically regardless of which QNAP model
+#                (or any other docker-compose host) you're on. Starts
+#                automatically with `docker-compose up -d`, same as
+#                dashboard -- you do NOT need to configure anything in
+#                QNAP's own Control Panel for scheduling to work.
+#
+# All three share the same ./data volume (the SQLite DB + CSVs) so
 # whatever the pipeline just wrote is immediately visible to the running
 # dashboard without a restart.
 #
 # ./constituents is ALSO mounted (not baked into the image) even though
-# it ships with the repo -- pipeline runs via `docker compose run --rm`,
-# which deletes the container after each run. Without this mount, a
-# successful refresh_universe run would update constituents/*.csv only
-# inside that now-deleted container, silently losing the whole point of
-# the fallback cache (see src/ingestion/universe.py's
-# CONSTITUENTS_CACHE_DIR comment) on every single run.
+# it ships with the repo -- pipeline/scheduler runs update it via
+# `docker-compose run --rm` / a container that could be recreated on
+# `docker-compose up`. Without this mount, a successful refresh_universe
+# run would update constituents/*.csv only inside that (disposable)
+# container, silently losing the whole point of the fallback cache (see
+# src/ingestion/universe.py's CONSTITUENTS_CACHE_DIR comment) on every
+# single run.
 version: "3.8"
 
 services:
@@ -64,3 +78,18 @@ services:
       - BREADTH_DB_PATH=/app/data/breadth.db
     env_file:
       - .env
+
+  scheduler:
+    build: .
+    image: market-breadth-detector:latest
+    container_name: market-breadth-scheduler
+    command: bash nas/scheduler_entrypoint.sh
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./constituents:/app/constituents
+    environment:
+      - BREADTH_DB_PATH=/app/data/breadth.db
+    env_file:
+      - .env
+    restart: unless-stopped

@@ -37,7 +37,34 @@ def init_db() -> None:
 
 
 def upsert_prices(df: pd.DataFrame) -> None:
-    """df columns: date, ticker, open, high, low, close, volume"""
+    """df columns: date, ticker, open, high, low, close, volume
+
+    Normalizes `date` to a canonical YYYY-MM-DD string before writing.
+    Without this, whatever shape the incoming DataFrame's `date` column
+    happens to be in (a plain "YYYY-MM-DD" string from one ingest path vs.
+    a datetime64/Timestamp that stringifies with a " 00:00:00" suffix from
+    another) gets written to SQLite exactly as-is. Since prices' PK is
+    (date, ticker) and SQLite compares TEXT primary keys byte-for-byte,
+    two different string representations of the SAME calendar date don't
+    collide -- so re-ingesting a ticker's history in a different date
+    format doesn't upsert over the old rows, it silently duplicates them.
+    Confirmed live on the NAS deployment: early rows were written as
+    "2024-07-17 00:00:00" (with a time component) while later ingests
+    wrote plain "2024-07-17" for the same calendar days, which both
+    inflated row counts (duplicate rows per ticker/day) AND, on read,
+    caused pandas' pd.read_sql(..., parse_dates=["date"]) to infer a
+    single date format from whichever row happened to be physically first
+    in the table and silently turn every non-matching row into NaT --
+    wiping breadth_daily entirely for any index whose tickers were
+    dominated by the "losing" format (this is what caused Russell 2000,
+    S&P 400, and S&P 600 to show zero breadth data despite full price
+    coverage). See scripts/breadth_compute.py's read side and
+    scripts/migrate_normalize_prices_dates.py for the corresponding
+    read-side hardening and one-time cleanup of data already written
+    before this fix.
+    """
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     with get_connection() as conn:
         df.to_sql("prices_staging", conn, if_exists="replace", index=False)
         conn.execute(

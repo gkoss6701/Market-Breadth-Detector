@@ -100,7 +100,23 @@ def main():
         return
 
     with get_connection() as conn:
-        prices = pd.read_sql("SELECT * FROM prices", conn, parse_dates=["date"])
+        # NOT parse_dates=["date"] here -- pd.read_sql's parse_dates infers
+        # a single date format from whichever row is physically first in
+        # the table and silently NaTs every row that doesn't match it. If
+        # the `prices` table has any rows left over from before the
+        # date-normalization fix in upsert_prices() (a mix of
+        # "YYYY-MM-DD" and "YYYY-MM-DD HH:MM:SS" strings for what's
+        # actually the same calendar date), that silently drops all
+        # breadth data for whichever tickers "lost" the format lottery --
+        # this is exactly what happened to Russell 2000/S&P 400/S&P 600.
+        # format="mixed" parses each value independently instead of
+        # caching one inferred format for the whole column, so it's
+        # correct regardless of what's already on disk. Run
+        # scripts/migrate_normalize_prices_dates.py once to clean up any
+        # pre-existing mixed-format rows (also collapses the duplicate
+        # rows that formatting mismatch caused under INSERT OR REPLACE).
+        prices = pd.read_sql("SELECT * FROM prices", conn)
+        prices["date"] = pd.to_datetime(prices["date"], format="mixed")
         constituents = pd.read_sql("SELECT * FROM index_constituents", conn)
 
     if prices.empty:
@@ -117,6 +133,20 @@ def main():
 
         history = compute_history_for_index(prices, index_key, tickers)
         if history.empty:
+            # Matched tickers exist (compute_history_for_index already
+            # logs its own warning for the 0-tickers-matched case), but
+            # every computed row was dropped by the ad_line dropna --
+            # previously a true silent skip with no logging at all, which
+            # is exactly how the Russell 2000/S&P 400/S&P 600 date-format
+            # bug went unnoticed. Surface it instead of swallowing it.
+            logger.warning(
+                "Index '%s' matched %d tickers but produced zero computable "
+                "breadth rows (ad_line was NaN for every date) -- check for "
+                "date-format inconsistencies in `prices` (see "
+                "scripts/migrate_normalize_prices_dates.py) or insufficient "
+                "overlapping price history for this index's tickers.",
+                index_key, len(tickers),
+            )
             continue
 
         all_histories.append(history)

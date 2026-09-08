@@ -2,9 +2,10 @@
 Refreshes the index registry: pulls current constituents for every major
 and sector index and replaces index_constituents / index_metadata.
 Run weekly (constituent lists change infrequently -- daily refresh would
-be wasted load on the source sites) via nas/weekly_refresh.sh on the NAS
-Task Scheduler, or manually whenever you want to pick up index changes
-immediately (e.g. after a known S&P 500 rebalance).
+be wasted load on the source sites) via nas/weekly_refresh.sh, fired
+automatically by the `scheduler` docker-compose service's in-container
+cron (see nas/scheduler.crontab), or manually whenever you want to pick
+up index changes immediately (e.g. after a known S&P 500 rebalance).
 
 Resilient to a single source failing: all eight major sources (S&P
 500/400/600, Nasdaq-100, Dow 30, Russell 1000/2000/3000) fall back to

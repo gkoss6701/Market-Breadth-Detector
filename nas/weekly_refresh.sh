@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # Weekly universe refresh: repopulates index_constituents / index_metadata
 # for every major + sector index. This replaces the old
-# refresh_universe.yml GitHub Action -- run it via QNAP Task Scheduler,
-# Saturdays (constituent lists change infrequently, no need for daily):
+# refresh_universe.yml GitHub Action. Fired automatically, Saturdays
+# (constituent lists change infrequently, no need for daily), by the
+# `scheduler` docker-compose service's in-container cron (see
+# nas/scheduler.crontab / nas/scheduler_entrypoint.sh) -- no QNAP Task
+# Scheduler configuration needed. Also fine to run manually / on-demand
+# any time:
 #
-#   docker compose run --rm pipeline bash nas/weekly_refresh.sh
+#   docker-compose run --rm pipeline bash nas/weekly_refresh.sh
 set -euo pipefail
 
 LOG_DIR="${LOG_DIR:-/app/logs}"

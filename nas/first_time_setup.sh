@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # One-time setup: populates the index registry, backfills 2 years of
 # price history, then computes breadth for every index. Run this once
-# after `docker compose build`, before turning on the scheduled tasks in
-# QNAP Task Scheduler:
+# after `docker-compose build`, before starting the `scheduler` service
+# (`docker-compose up -d scheduler`) that fires the recurring jobs:
 #
-#   docker compose run --rm pipeline bash nas/first_time_setup.sh
+#   docker-compose run --rm pipeline bash nas/first_time_setup.sh
 #
 # Safe to re-run (every step upserts rather than appends), but the
 # backfill step alone can take several minutes (~500-600 tickers via
